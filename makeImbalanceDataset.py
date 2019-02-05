@@ -44,14 +44,14 @@ class ImbalancedDataset():
       (x_train, y_train), (x_test, y_test) = tf.keras.datasets.cifar10.load_data()
     else:
       raise ValueError('Dataset {} is not defined'.format(self.dataset))
-    return (x_train, y_train), (x_test, y_test)
+    return (x_train, np.squeeze(y_train)), (x_test, np.squeeze(y_test))
 
   def _make_imbalance(self):
     (x_train, y_train), (x_test, y_test) = self._get_data()
     for i, c in enumerate(self.class_labels):
       n_train_samples = int(self.train_size * self.ratio) if i==0 else int(self.train_size * (1-self.ratio))
       n_validation_samples = int(self.validation_size / len(self.class_labels))
-      train_ind = np.argwhere(y_train == c)
+      train_ind = np.squeeze(np.argwhere(y_train == c))
       assert (len(train_ind) >= self.ratio*(self.train_size + self.validation_size)), "Number of samples requested is greater than number of samples provided"
       test_ind = np.argwhere(y_test == c)
       if i == 0:
