@@ -13,8 +13,8 @@ import sys
 from tqdm import tqdm
 
 
-def _float_feature(value):
-  return tf.train.Feature(float_list=tf.train.FloatList(value=[value]))
+def _int_feature(value):
+  return tf.train.Feature(int64_list=tf.train.Int64List(value=[value]))
 
 
 def _bytes_feature(value):
@@ -63,7 +63,7 @@ class ImbalancedDataset():
         self.test['label'] = np.zeros(len(test_ind))
       else:
         self.train['data'] = np.concatenate((self.train['data'],x_train[train_ind[:n_train_samples],:]),axis=0)
-        self.train['label'] = np.concatenate((self.train['label'], np.ones(n_train_samples)))
+        self.train['label'] = np.concatenate((self.train['label'], np.ones(n_train_samples) ))
         self.validation['data'] =  np.concatenate((self.validation['data'],
                                   x_train[train_ind[n_train_samples:n_train_samples+n_validation_samples],:]), axis=0)
         self.validation['label'] = np.concatenate((self.validation['label'], np.ones(n_validation_samples)))
@@ -86,14 +86,14 @@ class ImbalancedDataset():
     print('Generating %s' % output_file)
     with tf.python_io.TFRecordWriter(output_file) as record_writer:
       data = data_dict['data']
-      labels = data_dict['label']
+      labels = data_dict['label'].astype(np.int64)
 
       num_entries_in_batch = len(labels)
       for i in tqdm(range(num_entries_in_batch)):
         example = tf.train.Example(features=tf.train.Features(
             feature={
                 'data': _bytes_feature(data[i].tobytes()),
-                'label': _float_feature(labels[i])
+                'label': _int_feature(labels[i])
             }))
         record_writer.write(example.SerializeToString())
   
