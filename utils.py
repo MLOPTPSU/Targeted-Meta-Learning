@@ -117,3 +117,55 @@ class ExamplesPerSecondHook(session_run_hook.SessionRunHook):
                      average_examples_per_sec, current_examples_per_sec,
                      self._total_steps)
 
+
+class NanFinderHook(session_run_hook.SessionRunHook):
+  def __init__(
+      self,
+      params_list,
+      every_n_steps=1,
+      every_n_secs=None,):
+
+    if (every_n_steps is None) == (every_n_secs is None):
+      raise ValueError('exactly one of every_n_steps'
+                       ' and every_n_secs should be provided.')
+    self._timer = basic_session_run_hooks.SecondOrStepTimer(
+        every_steps=every_n_steps, every_secs=every_n_secs)
+
+    self._step_train_time = 0
+    self._total_steps = 0
+    self._params_list = params_list
+    self._nan_list = tf.reduce_any([tf.reduce_any(tf.is_nan(p)) for p in self._params_list])
+    self._inf_list = tf.reduce_any([tf.reduce_any(tf.is_inf(p)) for p in self._params_list])
+
+  def begin(self):
+    self._global_step_tensor = training_util.get_global_step()
+    if self._global_step_tensor is None:
+      raise RuntimeError(
+          'Global step should be created to use StepCounterHook.')
+
+  def before_run(self, run_context):  # pylint: disable=unused-argument
+    global_step = run_context.session.run(self._global_step_tensor)
+
+    if self._timer.should_trigger_for_step(global_step):
+      nan_list_ev = run_context.session.run(self._nan_list)
+      inf_list_ev = run_context.session.run(self._inf_list)
+      # nan_inds = [i for i, x in enumerate(nan_list_ev) if x.any()]
+      # nan_params = [self._params_list[i] for i in nan_inds]
+      
+      logging.info('Are params are nan or inf before run:')
+      logging.info(nan_list_ev)
+      logging.info(inf_list_ev)
+
+      self._timer.update_last_triggered_step(global_step)
+
+  def after_run(self, run_context, run_values):
+    nan_list_ev  = run_context.session.run(self._nan_list)
+    inf_list_ev = run_context.session.run(self._inf_list)
+    # nan_inds = [i for i, x in enumerate(nan_list_ev) if x.any()]
+    # nan_params = [self._params_list[i] for i in nan_inds]
+    logging.info('Are params are nan or inf after run:')
+    logging.info(nan_list_ev)
+    logging.info(inf_list_ev)
+
+
+

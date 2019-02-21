@@ -28,7 +28,7 @@ import tensorflow as tf
 class ResNet(object):
   """ResNet model."""
 
-  def __init__(self, is_training, data_format, batch_norm_decay, batch_norm_epsilon, tower_id):
+  def __init__(self, is_training, data_format, batch_norm_decay, batch_norm_epsilon):
     """ResNet constructor.
     Args:
       is_training: if build training or inference model.
@@ -40,7 +40,6 @@ class ResNet(object):
     self._is_training = is_training
     assert data_format in ('channels_first', 'channels_last')
     self._data_format = data_format
-    self._tower_id = tower_id
 
   def forward_pass(self, x):
     raise NotImplementedError(

@@ -24,7 +24,7 @@ def _bytes_feature(value):
 
 
 class ImbalancedDataset():
-  def __init__(self, train_size=5000, validation_size=5, class_labels=[2,3], ratio=0.9, dataset='mnist'):
+  def __init__(self, train_size=5000, validation_size=10, class_labels=[2,3], ratio=0.9, dataset='mnist'):
     self.train_size = train_size
     self.validation_size = validation_size
     self.class_labels = class_labels
@@ -53,13 +53,13 @@ class ImbalancedDataset():
       n_validation_samples = int(self.validation_size / len(self.class_labels))
       train_ind = np.squeeze(np.argwhere(y_train == c))
       assert (len(train_ind) >= self.ratio*(self.train_size + self.validation_size)), "Number of samples requested is greater than number of samples provided"
-      test_ind = np.argwhere(y_test == c)
+      test_ind = np.squeeze(np.argwhere(y_test == c))
       if i == 0:
         self.train['data'] = x_train[train_ind[:n_train_samples],:]
         self.train['label'] = np.zeros(n_train_samples)
         self.validation['data'] =  x_train[train_ind[n_train_samples:n_train_samples+n_validation_samples],:]
         self.validation['label'] = np.zeros(n_validation_samples)
-        self.test['data'] = x_train[test_ind,:]
+        self.test['data'] = x_test[test_ind,:]
         self.test['label'] = np.zeros(len(test_ind))
       else:
         self.train['data'] = np.concatenate((self.train['data'],x_train[train_ind[:n_train_samples],:]),axis=0)
@@ -67,7 +67,7 @@ class ImbalancedDataset():
         self.validation['data'] =  np.concatenate((self.validation['data'],
                                   x_train[train_ind[n_train_samples:n_train_samples+n_validation_samples],:]), axis=0)
         self.validation['label'] = np.concatenate((self.validation['label'], np.ones(n_validation_samples)))
-        self.test['data'] = np.concatenate((self.test['data'], x_train[test_ind,:]))
+        self.test['data'] = np.concatenate((self.test['data'], x_test[test_ind,:]),axis=0)
         self.test['label'] = np.concatenate((self.test['label'], np.ones(len(test_ind))))
     
     self.train = self._make_shuffle(self.train)
