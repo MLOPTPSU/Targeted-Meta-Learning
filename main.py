@@ -66,8 +66,16 @@ def get_model_fn(features, labels, mode, params):
 	
 	# Building the main model
 	with tf.variable_scope('base_model') as var_scope:
-		base_model = model.BilevelLenet()
-		base_model_logits = base_model(train_features)
+		if params.dataset == 'mnist':
+			base_model = model.BilevelLenet()
+		else:
+			base_model = model.BilevelResNet(params.num_layers,
+																			 is_training,
+																			 params.batch_norm_decay,
+																			 params.batch_norm_epsilon,
+																			 data_format,
+																			 version='v1')
+		base_model_logits = base_model(train_features, data_format)
 		update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS, var_scope.name)
 		# Get the params of the model
 		base_model_params = tf.trainable_variables(scope=var_scope.name)
@@ -94,7 +102,7 @@ def get_model_fn(features, labels, mode, params):
 	
 	with tf.variable_scope('bilevel_model', reuse=tf.AUTO_REUSE) as var_scope1:
 		base_model.perturb_model_weights(base_model_loss_reduced, params.learning_rate, var_scope.name)
-		target_logits = base_model(val_features)
+		target_logits = base_model(val_features, data_format)
 		target_params = tf.trainable_variables(scope=var_scope1.name)
 		target_loss, target_preds = _loss_fn(target_logits, val_labels)
 		target_loss = tf.reduce_mean(target_loss) + weight_decay * tf.add_n(
@@ -112,7 +120,7 @@ def get_model_fn(features, labels, mode, params):
 			tf.matmul(
 				tf.transpose(train_labels),
 				update_weight
-			) * 2 
+			)
 		)
 	]
 	# update_weight = tf.nn.l2_normalize(update_weight)
@@ -141,7 +149,7 @@ def get_model_fn(features, labels, mode, params):
 	tensors_to_log = {'Target loss': target_loss, 'Main loss':base_model_loss_reduced, 'class_weights':class_weights}
 
 	logging_hook = tf.train.LoggingTensorHook(
-		tensors=tensors_to_log, every_n_iter=100)
+		tensors=tensors_to_log, every_n_iter=10)
 	train_hooks = [logging_hook, examples_sec_hook]
 
 
@@ -212,7 +220,7 @@ def main(job_dir, data_dir, num_gpus, use_distortion_for_training,
 
   config = utils.RunConfig(
 	  session_config=sess_config, model_dir=job_dir)
-  config = config.replace(save_checkpoints_steps=100)
+  # config = config.replace(save_checkpoints_steps=100)
 
   train_input_fn = functools.partial(
 	  input_fn,
@@ -235,7 +243,7 @@ def main(job_dir, data_dir, num_gpus, use_distortion_for_training,
   eval_steps = 2000 // hparams['eval_batch_size']
 
   train_spec = tf.estimator.TrainSpec(train_input_fn, max_steps=train_steps)
-  eval_spec = tf.estimator.EvalSpec(input_fn=eval_input_fn, steps=eval_steps, start_delay_secs=0,  throttle_secs=10)
+  eval_spec = tf.estimator.EvalSpec(input_fn=eval_input_fn, steps=eval_steps,   throttle_secs=6000)
 
   classifier = tf.estimator.Estimator(
 	  model_fn=get_model_fn,
