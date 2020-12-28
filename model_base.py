@@ -1,499 +1,480 @@
-"""ResNet model.
-Related papers:
-https://arxiv.org/pdf/1603.05027v2.pdf
-https://arxiv.org/pdf/1512.03385v1.pdf
-https://arxiv.org/pdf/1605.07146v1.pdf
 """
+This is the ResNet base model, based on Google implementation.
+We use tf.keras layers to build the model so they can be adopted to the Bilevel class.
+"""
+
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
 import tensorflow as tf
 
-class ResNet1(object):
-  """ResNet model."""
-
-  def __init__(self, is_training, data_format, batch_norm_decay, batch_norm_epsilon, activate_before_residual=False):
-    """ResNet constructor.
-    Args:
-      is_training: if build training or inference model.
-      data_format: the data_format used during computation.
-                   one of 'channels_first' or 'channels_last'.
-    """
-    self._batch_norm_decay = batch_norm_decay
-    self._batch_norm_epsilon = batch_norm_epsilon
-    self._is_training = is_training
-    assert data_format in ('channels_first', 'channels_last')
-    self._data_format = data_format
-    self._activate_before_residual = activate_before_residual
+_BATCH_NORM_DECAY = 0.997
+_BATCH_NORM_EPSILON = 1e-5
+DEFAULT_VERSION = 'v2'
+DEFAULT_DTYPE = tf.float32
+CASTABLE_TYPES = (tf.float16,)
+ALLOWED_TYPES = (DEFAULT_DTYPE,) + CASTABLE_TYPES
 
 
-  def _residual_v1_build(self,
-                          x,
-                          kernel_size,
-                          in_filter,
-                          out_filter,
-                          stride):
-    """Residual unit with 2 sub layers, using Plan A for shortcut connection."""
-    layers = []
-    with tf.name_scope('residual_v1') as name_scope:
-      orig_x = x
+################################################################################
+# Convenience functions for building the ResNet model.
+################################################################################
+def batch_norm_build(data_format):
+  """Performs a batch normalization using a standard set of parameters."""
+  # We set fused=True for a significant performance boost. See
+  # https://www.tensorflow.org/performance/performance_guide#common_fused_ops
+  return tf.keras.layers.BatchNormalization(
+      axis=1 if data_format == 'channels_first' else 3, trainable=True,
+      momentum=_BATCH_NORM_DECAY, epsilon=_BATCH_NORM_EPSILON, center=True,
+      scale=True, fused=False)
 
-      if stride > 1:
-        x, zero_pad0 = self._padding(x, padding=kernel_size-1)
-        layers.append([zero_pad0])
-      x, conv1 = self._conv(x, kernel_size, out_filter, stride)
-      x, batch_norm1 = self._batch_norm(x)
-      x, relu1 = self._relu(x)
+def batch_norm(inputs, training, layer):
+  """Performs a batch normalization using a standard set of parameters."""
+  # We set fused=True for a significant performance boost. See
+  # https://www.tensorflow.org/performance/performance_guide#common_fused_ops
+  return layer(inputs=inputs, training=training)
 
-      x, conv2 = self._conv(x, kernel_size, out_filter, 1)
-      x, batch_norm2 = self._batch_norm(x)
+def fixed_padding(inputs, kernel_size, data_format):
+  """Pads the input along the spatial dimensions independently of input size.
+  Args:
+    inputs: A tensor of size [batch, channels, height_in, width_in] or
+      [batch, height_in, width_in, channels] depending on data_format.
+    kernel_size: The kernel to be used in the conv2d or max_pool2d operation.
+                 Should be a positive integer.
+    data_format: The input format ('channels_last' or 'channels_first').
+  Returns:
+    A tensor with the same format as the input with the data either intact
+    (if kernel_size == 1) or padded (if kernel_size > 1).
+  """
+  pad_total = kernel_size - 1
+  pad_beg = pad_total // 2
+  pad_end = pad_total - pad_beg
 
-      if layers:
-        layers[0].extend([conv1, batch_norm1, relu1, conv2, batch_norm2])
-      else:
-        layers.append([conv1, batch_norm1, relu1, conv2, batch_norm2])
+  if data_format == 'channels_first':
+    padded_inputs = tf.pad(tensor=inputs,
+                           paddings=[[0, 0], [0, 0], [pad_beg, pad_end],
+                                     [pad_beg, pad_end]])
+  else:
+    padded_inputs = tf.pad(tensor=inputs,
+                           paddings=[[0, 0], [pad_beg, pad_end],
+                                     [pad_beg, pad_end], [0, 0]])
+  return padded_inputs
 
-      if in_filter != out_filter:
-        orig_x, avg_pool1 = self._avg_pool(orig_x, stride, stride)
-        layers.append([avg_pool1])
-        pad = (out_filter - in_filter) // 2
-        if self._data_format == 'channels_first':
-          orig_x = tf.pad(orig_x, [[0, 0], [pad, pad], [0, 0], [0, 0]])
-        else:
-          orig_x = tf.pad(orig_x, [[0, 0], [0, 0], [0, 0], [pad, pad]])
 
-      x, relu2 = self._relu(tf.add(x, orig_x))
-      layers.append([relu2])
-      tf.logging.info('image after unit %s: %s', name_scope, x.get_shape())
-      return x, layers
+def conv2d_fixed_padding(inputs, layer, kernel_size, strides, data_format):
+  """Strided 2-D convolution with explicit padding."""
+  # The padding is consistent and is based only on `kernel_size`, not on the
+  # dimensions of `inputs` (as opposed to using `tf.layers.conv2d` alone).
+  if strides > 1:
+    inputs = fixed_padding(inputs, kernel_size, data_format)
+
+  return layer(inputs)
+
+def conv2d_fixed_padding_build(filters, kernel_size, strides, data_format):
+  """Strided 2-D convolution with explicit padding."""
+  return tf.keras.layers.Conv2D(
+      filters=filters, kernel_size=kernel_size, strides=strides,
+      padding=('SAME' if strides == 1 else 'VALID'), use_bias=False,
+      kernel_initializer=tf.keras.initializers.VarianceScaling(),
+      data_format=data_format)
+
+
+
+################################################################################
+# ResNet block definitions.
+################################################################################
+def _building_block_v1_build(filters, projection_shortcut, strides,
+                       data_format):
+  layers = []
+  if projection_shortcut is not None:
+    shortcut_layer = projection_shortcut()
+    layers.append(shortcut_layer)
+
+  conv_layer = conv2d_fixed_padding_build(
+      filters=filters, kernel_size=3, strides=strides,
+      data_format=data_format)
+  layers.append(conv_layer)
+  batch_norm_layer = batch_norm_build(data_format=data_format)
+  layers.append(batch_norm_layer)
+  conv_layer1 = conv2d_fixed_padding_build(
+      filters=filters, kernel_size=3, strides=1,
+      data_format=data_format)
+  layers.append(conv_layer1)
+  batch_norm_layer1 = batch_norm_build(data_format=data_format)
+  layers.append(batch_norm_layer1)
+
+  return layers
+
+def _building_block_v1(inputs, layers, training, projection_shortcut, strides,
+                       data_format):
+  """A single block for ResNet v1, without a bottleneck.
+  Convolution then batch normalization then ReLU as described by:
+    Deep Residual Learning for Image Recognition
+    https://arxiv.org/pdf/1512.03385.pdf
+    by Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun, Dec 2015.
+  Args:
+    inputs: A tensor of size [batch, channels, height_in, width_in] or
+      [batch, height_in, width_in, channels] depending on data_format.
+
+    training: A Boolean for whether the model is in training or inference
+      mode. Needed for batch normalization.
+    projection_shortcut: The function to use for projection shortcuts
+      (typically a 1x1 convolution when downsampling the input).
+    strides: The block's stride. If greater than 1, this block will ultimately
+      downsample the input.
+    data_format: The input format ('channels_last' or 'channels_first').
+  Returns:
+    The output tensor of the block; shape should match inputs.
+  """
+  layers_copy = list(layers).copy()
+  shortcut = inputs
+
+  if projection_shortcut is not None:
+    shortcut = conv2d_fixed_padding(
+          inputs=inputs, layer=layers_copy.pop(0),
+          kernel_size=1, strides=strides, data_format=data_format)
+
+  inputs = conv2d_fixed_padding(
+      inputs=inputs, layer=layers_copy.pop(0), kernel_size=3, strides=strides,
+      data_format=data_format)
+  inputs = batch_norm(inputs=inputs, training=training, layer=layers_copy.pop(0))
+  inputs = tf.nn.relu(inputs)
+
+  inputs = conv2d_fixed_padding(
+      inputs=inputs, layer=layers_copy.pop(0), kernel_size=3, strides=1,
+      data_format=data_format)
+  inputs = batch_norm(inputs=inputs, training=training, layer=layers_copy.pop(0))
+  inputs += shortcut
+  inputs = tf.nn.relu(inputs)
+
+  return inputs
+
+
+def _building_block_v2_build(filters, projection_shortcut, strides,
+                       data_format):
+
+  layers = []
+  batch_norm_layer = batch_norm_build(data_format=data_format)
+  layers.append(batch_norm_layer)
+  if projection_shortcut is not None:
+    shortcut_layer = projection_shortcut()
+    layers.append(shortcut_layer)
   
-  def _residual_v1(self,
-                    x,
-                    in_filter,
-                    out_filter,
-                    layers=[]):
-    """Residual unit with 2 sub layers, using Plan A for shortcut connection."""
+  conv_layer = conv2d_fixed_padding_build(
+      filters=filters, kernel_size=3, strides=strides,
+      data_format=data_format)
+  layers.append(conv_layer)
+  batch_norm_layer1 = batch_norm_build(data_format=data_format)
+  layers.append(batch_norm_layer1)
+  conv_layer1 = conv2d_fixed_padding_build(
+      filters=filters, kernel_size=3, strides=1,
+      data_format=data_format)
+  layers.append(conv_layer1)
 
-    assert len(layers) > 0,'The layers list is empty. make sure you build the model first'
-    orig_x = x
-    for l in layers[0]:
-      x = l(x)
+  return layers
 
-    if in_filter != out_filter:
-      orig_x = layers[1][0](orig_x)
-      pad = (out_filter - in_filter) // 2
-      if self._data_format == 'channels_first':
-        orig_x = tf.pad(orig_x, [[0, 0], [pad, pad], [0, 0], [0, 0]])
-      else:
-        orig_x = tf.pad(orig_x, [[0, 0], [0, 0], [0, 0], [pad, pad]])
+def _building_block_v2(inputs, layers, training, projection_shortcut, strides,
+                       data_format):
+  """A single block for ResNet v2, without a bottleneck.
+  Batch normalization then ReLu then convolution as described by:
+    Identity Mappings in Deep Residual Networks
+    https://arxiv.org/pdf/1603.05027.pdf
+    by Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun, Jul 2016.
+  Args:
+    inputs: A tensor of size [batch, channels, height_in, width_in] or
+      [batch, height_in, width_in, channels] depending on data_format.
+    filters: The number of filters for the convolutions.
+    training: A Boolean for whether the model is in training or inference
+      mode. Needed for batch normalization.
+    projection_shortcut: The function to use for projection shortcuts
+      (typically a 1x1 convolution when downsampling the input).
+    strides: The block's stride. If greater than 1, this block will ultimately
+      downsample the input.
+    data_format: The input format ('channels_last' or 'channels_first').
+  Returns:
+    The output tensor of the block; shape should match inputs.
+  """
+  layers_copy = list(layers).copy()
 
-    x = layers[-1][0](tf.add(x, orig_x))
-    return x
+  shortcut = inputs
+  inputs = batch_norm(inputs=inputs, training=training, layer=layers_copy.pop(0))
+  inputs = tf.nn.relu(inputs)
 
-  def _residual_v2_build(self,
-                          x,
-                          kernel_size,
-                          in_filter,
-                          out_filter,
-                          stride):
-    """Residual unit with 2 sub layers with preactivation, plan A shortcut."""
-    layers = []
-    with tf.name_scope('residual_v2') as name_scope:
-      if self._activate_before_residual:
-        x, batch_norm1 = self._batch_norm(x)
-        x, relu1 = self._relu(x)
-        orig_x = x
-      else:
-        orig_x = x
-        x, batch_norm1 = self._batch_norm(x)
-        x, relu1= self._relu(x)
-      layers.append([batch_norm1, relu1])
+  # The projection shortcut should come after the first batch norm and ReLU
+  # since it performs a 1x1 convolution.
+  if projection_shortcut is not None:
+    shortcut = conv2d_fixed_padding(
+          inputs=inputs, layer=layers_copy.pop(0),
+          kernel_size=1, strides=strides, data_format=data_format)
 
-      if stride > 1:
-        x, zero_pad0 = self._padding(x, padding=kernel_size-1)
-        layers.append([zero_pad0])
-      x, conv1 = self._conv(x, kernel_size, out_filter, stride)
+  inputs = conv2d_fixed_padding(
+        inputs=inputs, layer=layers_copy.pop(0),
+        kernel_size=3, strides=strides, data_format=data_format)
 
-      x, batch_norm2 = self._batch_norm(x)
-      x, relu2 = self._relu(x)
-      x, conv2 = self._conv(x, kernel_size, out_filter, 1)
-      if len(layers) > 1:
-        layers[1].extend([conv1, batch_norm2, relu2, conv2])
-      else:
-        layers.append([conv1, batch_norm2, relu2, conv2])
-    
-      if in_filter != out_filter:
-        pad = (out_filter - in_filter) // 2
-        orig_x, avg_pool1 = self._avg_pool(orig_x, stride, stride)
-        layers.append([avg_pool1])
-        if self._data_format == 'channels_first':
-          orig_x = tf.pad(orig_x, [[0, 0], [pad, pad], [0, 0], [0, 0]])
-        else:
-          orig_x = tf.pad(orig_x, [[0, 0], [0, 0], [0, 0], [pad, pad]])
+  inputs = batch_norm(inputs=inputs, training=training, layer=layers_copy.pop(0))
+  inputs = tf.nn.relu(inputs)
+  inputs = conv2d_fixed_padding(
+        inputs=inputs, layer=layers_copy.pop(0), 
+        kernel_size=1, strides=1, data_format=data_format)
+  return inputs + shortcut 
 
-      x = tf.add(x, orig_x)
+def _bottleneck_block_v1_build(filters, projection_shortcut,
+                         strides, data_format):
+  layers = []
 
-      tf.logging.info('image after unit %s: %s', name_scope, x.get_shape())
-      return x, layers
+  if projection_shortcut is not None:
+    shortcut_layer = projection_shortcut()
+    layers.append(shortcut_layer)
 
-  def _residual_v2(self,
-                  x,
-                  in_filter,
-                  out_filter,
-                  layers=[]):
-    assert len(layers) > 0,'The layers list is empty. make sure you build the model first'
-    if self._activate_before_residual:
-      for l in layers[0]:
-        x = l(x)
-      orig_x = x
-    else:
-      orig_x = x
-      for l in layers[0]:
-        x = l(x)
-    
-    for l in layers[1]:
-      x = l(x)
-    
-    if in_filter != out_filter:
-      pad = (out_filter - in_filter) // 2
-      orig_x = layers[2][0](orig_x)
-      if self._data_format == 'channels_first':
-        orig_x = tf.pad(orig_x, [[0, 0], [pad, pad], [0, 0], [0, 0]])
-      else:
-        orig_x = tf.pad(orig_x, [[0, 0], [0, 0], [0, 0], [pad, pad]])
+  conv_layer = conv2d_fixed_padding_build(
+      filters=filters, kernel_size=1, strides=1,
+      data_format=data_format)
+  layers.append(conv_layer)
+  batch_norm_layer = batch_norm_build(data_format=data_format)
+  layers.append(batch_norm_layer)
 
-    x = tf.add(x, orig_x)
-    return x
+  conv_layer1 = conv2d_fixed_padding_build(
+      filters=filters, kernel_size=3, strides=strides,
+      data_format=data_format)
+  layers.append(conv_layer1)
+  batch_norm_layer1 = batch_norm_build(data_format=data_format)
+  layers.append(batch_norm_layer1)
 
-  def _bottleneck_residual_v2_build(self,
-                                    x,
-                                    kernel_size,
-                                    in_filter,
-                                    out_filter,
-                                    stride):
-    """Bottleneck residual unit with 3 sub layers, plan B shortcut."""
-    layers=[]
-    with tf.name_scope('bottle_residual_v2') as name_scope:
-      if self._activate_before_residual:
-        x, batch_norm1 = self._batch_norm(x)
-        x, relu1 = self._relu(x)
-        orig_x = x
-      else:
-        orig_x = x
-        x, batch_norm1 = self._batch_norm(x)
-        x, relu1= self._relu(x)
-      layers.append([batch_norm1, relu1])
+  conv_layer2 = conv2d_fixed_padding_build(
+      filters=4 * filters, kernel_size=1, strides=1,
+      data_format=data_format)
+  layers.append(conv_layer2)
+  batch_norm_layer2 = batch_norm_build(data_format=data_format)
+  layers.append(batch_norm_layer2)
 
-      x, conv1 = self._conv(x, 1, out_filter // 4, stride, is_atrous=True)
+  return layers
 
-      x, batch_norm2 = self._batch_norm(x)
-      x, relu2 = self._relu(x)
-      x, conv2 = self._conv(x, kernel_size, out_filter // 4, 1, is_atrous=True)
+def _bottleneck_block_v1(inputs, layers, training, projection_shortcut,
+                         strides, data_format):
+  """A single block for ResNet v1, with a bottleneck.
+  Similar to _building_block_v1(), except using the "bottleneck" blocks
+  described in:
+    Convolution then batch normalization then ReLU as described by:
+      Deep Residual Learning for Image Recognition
+      https://arxiv.org/pdf/1512.03385.pdf
+      by Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun, Dec 2015.
+  Args:
+    inputs: A tensor of size [batch, channels, height_in, width_in] or
+      [batch, height_in, width_in, channels] depending on data_format.
+    filters: The number of filters for the convolutions.
+    training: A Boolean for whether the model is in training or inference
+      mode. Needed for batch normalization.
+    projection_shortcut: The function to use for projection shortcuts
+      (typically a 1x1 convolution when downsampling the input).
+    strides: The block's stride. If greater than 1, this block will ultimately
+      downsample the input.
+    data_format: The input format ('channels_last' or 'channels_first').
+  Returns:
+    The output tensor of the block; shape should match inputs.
+  """
+  layers_copy = list(layers).copy()
+  shortcut = inputs
 
-      x, batch_norm3 = self._batch_norm(x)
-      x, relu3 = self._relu(x)
-      x, conv3= self._conv(x, 1, out_filter, 1, is_atrous=True)
+  if projection_shortcut is not None:
+    shortcut = conv2d_fixed_padding(
+          inputs=inputs, layer=layers_copy.pop(0),
+          kernel_size=1, strides=strides, data_format=data_format)
 
-      layers.append([conv1, batch_norm2, relu2, conv2, batch_norm3, relu3, conv3])
-      
-      if in_filter != out_filter:
-        orig_x, conv4 = self._conv(orig_x, 1, out_filter, stride, is_atrous=True)
-        layers.append([conv4])
+  inputs = conv2d_fixed_padding(
+      inputs=inputs, layer=layers_copy.pop(0), kernel_size=1, strides=1,
+      data_format=data_format)
+  inputs = batch_norm(inputs=inputs, training=training, layer=layers_copy.pop(0))
+  inputs = tf.nn.relu(inputs)
 
-      x = tf.add(x, orig_x)
+  inputs = conv2d_fixed_padding(
+      inputs=inputs, layer=layers_copy.pop(0), kernel_size=3, strides=strides,
+      data_format=data_format)
+  inputs = batch_norm(inputs=inputs, training=training, layer=layers_copy.pop(0))
+  inputs = tf.nn.relu(inputs)
 
-      tf.logging.info('image after unit %s: %s', name_scope, x.get_shape())
-      return x, layers
-  
-  def _bottleneck_residual_v2(self,
-                              x,
-                              in_filter,
-                              out_filter,
-                              layers=[]):
-    assert len(layers) > 0,'The layers list is empty. make sure you build the model first'
-    if self._activate_before_residual:
-      for l in layers[0]:
-        x = l(x)
-      orig_x = x
-    else:
-      orig_x = x
-      for l in layers[0]:
-        x = l(x)
-    
-    for l in layers[1]:
-      x = l(x)
-    
-    if in_filter != out_filter:
-      orig_x = layers[2][0](orig_x)
-    x = tf.add(x, orig_x)
+  inputs = conv2d_fixed_padding(
+      inputs=inputs, layer=layers_copy.pop(0), kernel_size=1, strides=1,
+      data_format=data_format)
+  inputs = batch_norm(inputs=inputs, training=training, layer=layers_copy.pop(0))
+  inputs += shortcut
+  inputs = tf.nn.relu(inputs)
 
-    return x
+  return inputs
 
-  def _conv(self, x, kernel_size, filters, strides, is_atrous=False):
-    """Convolution."""
+def _bottleneck_block_v2_build(filters, projection_shortcut,
+                         strides, data_format):
+  """A single block for ResNet v2, with a bottleneck.
+  Similar to _building_block_v2(), except using the "bottleneck" blocks
+  described in:
+    Convolution then batch normalization then ReLU as described by:
+      Deep Residual Learning for Image Recognition
+      https://arxiv.org/pdf/1512.03385.pdf
+      by Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun, Dec 2015.
+  Adapted to the ordering conventions of:
+    Batch normalization then ReLu then convolution as described by:
+      Identity Mappings in Deep Residual Networks
+      https://arxiv.org/pdf/1603.05027.pdf
+      by Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun, Jul 2016.
+  Args:
+    inputs: A tensor of size [batch, channels, height_in, width_in] or
+      [batch, height_in, width_in, channels] depending on data_format.
+    filters: The number of filters for the convolutions.
+    training: A Boolean for whether the model is in training or inference
+      mode. Needed for batch normalization.
+    projection_shortcut: The function to use for projection shortcuts
+      (typically a 1x1 convolution when downsampling the input).
+    strides: The block's stride. If greater than 1, this block will ultimately
+      downsample the input.
+    data_format: The input format ('channels_last' or 'channels_first').
+  Returns:
+    The output tensor of the block; shape should match inputs.
+  """
+  layers=[]
+  batch_norm_layer = batch_norm_build(data_format=data_format)
+  layers.append(batch_norm_layer)
 
-    padding = 'SAME'
-    if not is_atrous and strides > 1:
-      padding = 'VALID'
-    layer = tf.layers.Conv2D(
-        kernel_size=kernel_size,
-        filters=filters,
-        strides=strides,
-        padding=padding,
-        use_bias=False,
-        data_format=self._data_format)
-    return layer(x) , layer
+  # The projection shortcut should come after the first batch norm and ReLU
+  # since it performs a 1x1 convolution.
+  if projection_shortcut is not None:
+    shortcut_layer = projection_shortcut()
+    layers.append(shortcut_layer)
 
-  def _batch_norm(self, x):
-    if self._data_format == 'channels_first':
-      axis = 1 
-    else:
-      axis = -1
-    # For taking the second order gradient, we need to set
-    # fused in the Batch Normalization layer to be False.
-    # Otherwise, it will end up in an infinite loop.
-    layer = tf.layers.BatchNormalization(
-                  axis=axis,
-                  momentum=self._batch_norm_decay,
-                  epsilon=self._batch_norm_epsilon,
-                  fused=False)
-    return layer(x), layer
+  conv_layer = conv2d_fixed_padding_build(
+      filters=filters, kernel_size=1, strides=1,
+      data_format=data_format)
+  layers.append(conv_layer)
 
-  def _relu(self, x):
-    layer = tf.keras.layers.ReLU()
-    return layer(x), layer
+  batch_norm_layer1 = batch_norm_build(data_format=data_format)
+  layers.append(batch_norm_layer1)
+  conv_layer1 = conv2d_fixed_padding_build(
+      filters=filters, kernel_size=3, strides=strides,
+      data_format=data_format)
+  layers.append(conv_layer1)
 
-  def _fully_connected(self, x, out_dim, activation=None):
-    with tf.name_scope('fully_connected') as name_scope:
-      layer =  tf.layers.Dense(units=out_dim, activation=activation)
-      out = layer(x)
-    tf.logging.info('image after unit %s: %s', name_scope, out.get_shape())
-    return out, layer
+  batch_norm_layer2 = batch_norm_build(data_format=data_format)
+  layers.append(batch_norm_layer2)
+  conv_layer2 = conv2d_fixed_padding_build(
+      filters=4 * filters, kernel_size=1, strides=1,
+      data_format=data_format)
+  layers.append(conv_layer2)
 
-  def _avg_pool(self, x, pool_size, stride):
-    with tf.name_scope('avg_pool') as name_scope:
-      layer = tf.layers.AveragePooling2D(
-          pool_size, stride, 'SAME', data_format=self._data_format)
-      out = layer(x)
-    tf.logging.info('image after unit %s: %s', name_scope, out.get_shape())
-    return out, layer
+  return layers
 
-  def _global_avg_pool(self, x, build=False):
-    with tf.name_scope('global_avg_pool') as name_scope:
-      assert x.get_shape().ndims == 4
-      if self._data_format == 'channels_first':
-        x = tf.reduce_mean(x, [2, 3])
-      else:
-        x = tf.reduce_mean(x, [1, 2])
-    if build:
-      tf.logging.info('image after unit %s: %s', name_scope, x.get_shape())
-    return x
+def _bottleneck_block_v2(inputs, layers, training, projection_shortcut,
+                         strides, data_format):
+  """A single block for ResNet v2, with a bottleneck.
+  Similar to _building_block_v2(), except using the "bottleneck" blocks
+  described in:
+    Convolution then batch normalization then ReLU as described by:
+      Deep Residual Learning for Image Recognition
+      https://arxiv.org/pdf/1512.03385.pdf
+      by Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun, Dec 2015.
+  Adapted to the ordering conventions of:
+    Batch normalization then ReLu then convolution as described by:
+      Identity Mappings in Deep Residual Networks
+      https://arxiv.org/pdf/1603.05027.pdf
+      by Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun, Jul 2016.
+  Args:
+    inputs: A tensor of size [batch, channels, height_in, width_in] or
+      [batch, height_in, width_in, channels] depending on data_format.
+    filters: The number of filters for the convolutions.
+    training: A Boolean for whether the model is in training or inference
+      mode. Needed for batch normalization.
+    projection_shortcut: The function to use for projection shortcuts
+      (typically a 1x1 convolution when downsampling the input).
+    strides: The block's stride. If greater than 1, this block will ultimately
+      downsample the input.
+    data_format: The input format ('channels_last' or 'channels_first').
+  Returns:
+    The output tensor of the block; shape should match inputs.
+  """
+  layers_copy = list(layers).copy()
+  shortcut = inputs
+  inputs = batch_norm(inputs=inputs, training=training, layer=layers_copy.pop(0))
+  inputs = tf.nn.relu(inputs)
 
-  def _padding(self, x, padding):
-    pad_beg = padding // 2
-    pad_end = padding - pad_beg
-    layer = tf.keras.layers.ZeroPadding2D(padding=(pad_beg, pad_end), data_format=self._data_format)
-    return layer(x), layer
+  # The projection shortcut should come after the first batch norm and ReLU
+  # since it performs a 1x1 convolution.
+  if projection_shortcut is not None:
+    shortcut = conv2d_fixed_padding(
+          inputs=inputs, layer=layers_copy.pop(0),
+          kernel_size=1, strides=strides, data_format=data_format)
+
+  inputs = conv2d_fixed_padding(
+      inputs=inputs, layer=layers_copy.pop(0),
+      kernel_size=1, strides=1, data_format=data_format)
+
+  inputs = batch_norm(inputs=inputs, training=training, layer=layers_copy.pop(0))
+  inputs = tf.nn.relu(inputs)
+  inputs = conv2d_fixed_padding(
+      inputs=inputs, layer=layers_copy.pop(0), 
+      kernel_size=3, strides=strides, data_format=data_format)
+
+  inputs = batch_norm(inputs=inputs, training=training, layer=layers_copy.pop(0))
+  inputs = tf.nn.relu(inputs)
+  inputs = conv2d_fixed_padding(
+      inputs=inputs, layer=layers_copy.pop(0),
+      kernel_size=1, strides=1, data_format=data_format)
+
+  return inputs + shortcut
 
 
 
+def block_layer_build(filters, bottleneck, block_fn_build, blocks, strides,
+                name, data_format):
 
+  block_layers = []
+  # Bottleneck blocks end with 4x the number of filters as they start with
+  filters_out = filters * 4 if bottleneck else filters
 
-
-
-
-
-class ResNetOld(object):
-  """ResNet model."""
-
-  def __init__(self, is_training, data_format, batch_norm_decay, batch_norm_epsilon):
-    """ResNet constructor.
-    Args:
-      is_training: if build training or inference model.
-      data_format: the data_format used during computation.
-                   one of 'channels_first' or 'channels_last'.
-    """
-    self._batch_norm_decay = batch_norm_decay
-    self._batch_norm_epsilon = batch_norm_epsilon
-    self._is_training = is_training
-    assert data_format in ('channels_first', 'channels_last')
-    self._data_format = data_format
-
-  def forward_pass(self, x):
-    raise NotImplementedError(
-        'forward_pass() is implemented in ResNet sub classes')
-
-  def _residual_v1(self,
-                   x,
-                   kernel_size,
-                   in_filter,
-                   out_filter,
-                   stride,
-                   activate_before_residual=False):
-    """Residual unit with 2 sub layers, using Plan A for shortcut connection."""
-
-    del activate_before_residual
-    with tf.name_scope('residual_v1') as name_scope:
-      orig_x = x
-
-      x = self._conv(x, kernel_size, out_filter, stride)
-      x = self._batch_norm(x)
-      x = self._relu(x)
-
-      x = self._conv(x, kernel_size, out_filter, 1)
-      x = self._batch_norm(x)
-
-      if in_filter != out_filter:
-        orig_x = self._avg_pool(orig_x, stride, stride)
-        pad = (out_filter - in_filter) // 2
-        if self._data_format == 'channels_first':
-          orig_x = tf.pad(orig_x, [[0, 0], [pad, pad], [0, 0], [0, 0]])
-        else:
-          orig_x = tf.pad(orig_x, [[0, 0], [0, 0], [0, 0], [pad, pad]])
-
-      x = self._relu(tf.add(x, orig_x))
-
-      tf.logging.info('image after unit %s: %s', name_scope, x.get_shape())
-      return x
-
-  def _residual_v2(self,
-                   x,
-                   in_filter,
-                   out_filter,
-                   stride,
-                   activate_before_residual=False):
-    """Residual unit with 2 sub layers with preactivation, plan A shortcut."""
-
-    with tf.name_scope('residual_v2') as name_scope:
-      if activate_before_residual:
-        x = self._batch_norm(x)
-        x = self._relu(x)
-        orig_x = x
-      else:
-        orig_x = x
-        x = self._batch_norm(x)
-        x = self._relu(x)
-
-      x = self._conv(x, 3, out_filter, stride)
-
-      x = self._batch_norm(x)
-      x = self._relu(x)
-      x = self._conv(x, 3, out_filter, 1)
-
-      if in_filter != out_filter:
-        pad = (out_filter - in_filter) // 2
-        orig_x = self._avg_pool(orig_x, stride, stride)
-        if self._data_format == 'channels_first':
-          orig_x = tf.pad(orig_x, [[0, 0], [pad, pad], [0, 0], [0, 0]])
-        else:
-          orig_x = tf.pad(orig_x, [[0, 0], [0, 0], [0, 0], [pad, pad]])
-
-      x = tf.add(x, orig_x)
-
-      tf.logging.info('image after unit %s: %s', name_scope, x.get_shape())
-      return x
-
-  def _bottleneck_residual_v2(self,
-                              x,
-                              in_filter,
-                              out_filter,
-                              stride,
-                              activate_before_residual=False):
-    """Bottleneck residual unit with 3 sub layers, plan B shortcut."""
-
-    with tf.name_scope('bottle_residual_v2') as name_scope:
-      if activate_before_residual:
-        x = self._batch_norm(x)
-        x = self._relu(x)
-        orig_x = x
-      else:
-        orig_x = x
-        x = self._batch_norm(x)
-        x = self._relu(x)
-
-      x = self._conv(x, 1, out_filter // 4, stride, is_atrous=True)
-
-      x = self._batch_norm(x)
-      x = self._relu(x)
-      # pad when stride isn't unit
-      x = self._conv(x, 3, out_filter // 4, 1, is_atrous=True)
-
-      x = self._batch_norm(x)
-      x = self._relu(x)
-      x = self._conv(x, 1, out_filter, 1, is_atrous=True)
-
-      if in_filter != out_filter:
-        orig_x = self._conv(orig_x, 1, out_filter, stride, is_atrous=True)
-      x = tf.add(x, orig_x)
-
-      tf.logging.info('image after unit %s: %s', name_scope, x.get_shape())
-      return x
-
-  def _conv(self, x, kernel_size, filters, strides, is_atrous=False):
-    """Convolution."""
-
-    padding = 'SAME'
-    if not is_atrous and strides > 1:
-      pad = kernel_size - 1
-      pad_beg = pad // 2
-      pad_end = pad - pad_beg
-      if self._data_format == 'channels_first':
-        x = tf.pad(x, [[0, 0], [0, 0], [pad_beg, pad_end], [pad_beg, pad_end]])
-      else:
-        x = tf.pad(x, [[0, 0], [pad_beg, pad_end], [pad_beg, pad_end], [0, 0]])
-      padding = 'VALID'
-    return tf.layers.conv2d(
-        inputs=x,
-        kernel_size=kernel_size,
-        filters=filters,
-        strides=strides,
-        padding=padding,
-        use_bias=False,
-        data_format=self._data_format)
-
-  def _batch_norm(self, x):
-    if self._data_format == 'channels_first':
-      data_format = 'NCHW'
-    else:
-      data_format = 'NHWC'
-    return tf.contrib.layers.batch_norm(
-        x,
-        decay=self._batch_norm_decay,
-        center=True,
-        scale=True,
-        epsilon=self._batch_norm_epsilon,
-        is_training=self._is_training,
-        fused=True,
+  def projection_shortcut_build():
+    return conv2d_fixed_padding_build(
+        filters=filters_out, kernel_size=1, strides=strides,
         data_format=data_format)
 
-  def _relu(self, x):
-    return tf.nn.relu(x)
+  # Only the first block per block_layer uses projection_shortcut and strides
+  layers = block_fn_build(filters=filters, projection_shortcut=projection_shortcut_build,
+                          strides=strides, data_format=data_format)
+  block_layers.append(layers)
+  for _ in range(1, blocks):
+    layers = block_fn_build(filters=filters, projection_shortcut=None, strides=1, data_format=data_format)
+    block_layers.append(layers)
 
-  def _fully_connected(self, x, out_dim):
-    with tf.name_scope('fully_connected') as name_scope:
-      x = tf.layers.dense(x, out_dim)
+  return block_layers
 
-    tf.logging.info('image after unit %s: %s', name_scope, x.get_shape())
-    return x
+def block_layer(inputs, filters, bottleneck, block_fn, blocks, strides,
+                training, name, data_format, block_layers):
+  """Creates one layer of blocks for the ResNet model.
+  Args:
+    inputs: A tensor of size [batch, channels, height_in, width_in] or
+      [batch, height_in, width_in, channels] depending on data_format.
+    filters: The number of filters for the first convolution of the layer.
+    bottleneck: Is the block created a bottleneck block.
+    block_fn: The block to use within the model, either `building_block` or
+      `bottleneck_block`.
+    blocks: The number of blocks contained in the layer.
+    strides: The stride to use for the first convolution of the layer. If
+      greater than 1, this layer will ultimately downsample the input.
+    training: Either True or False, whether we are currently training the
+      model. Needed for batch norm.
+    name: A string name for the tensor output of the block layer.
+    data_format: The input format ('channels_last' or 'channels_first').
+  Returns:
+    The output tensor of the block layer.
+  """
+  block_layers_copy = list(block_layers).copy()
+  # Bottleneck blocks end with 4x the number of filters as they start with
+  filters_out = filters * 4 if bottleneck else filters
 
-  def _avg_pool(self, x, pool_size, stride):
-    with tf.name_scope('avg_pool') as name_scope:
-      x = tf.layers.average_pooling2d(
-          x, pool_size, stride, 'SAME', data_format=self._data_format)
+  # Only the first block per block_layer uses projection_shortcut and strides
+  inputs = block_fn(inputs=inputs, layers=block_layers_copy.pop(0), 
+                    training=training, projection_shortcut=True,
+                    strides=strides, data_format=data_format)
 
-    tf.logging.info('image after unit %s: %s', name_scope, x.get_shape())
-    return x
+  for _ in range(1, blocks):
+    inputs = block_fn(inputs=inputs, layers=block_layers_copy.pop(0),
+                      training=training, projection_shortcut=None, 
+                      strides=1, data_format=data_format)
 
-  def _global_avg_pool(self, x):
-    with tf.name_scope('global_avg_pool') as name_scope:
-      assert x.get_shape().ndims == 4
-      if self._data_format == 'channels_first':
-        x = tf.reduce_mean(x, [2, 3])
-      else:
-        x = tf.reduce_mean(x, [1, 2])
-    tf.logging.info('image after unit %s: %s', name_scope, x.get_shape())
-    return x
-
-
-
+  return tf.identity(inputs, name)

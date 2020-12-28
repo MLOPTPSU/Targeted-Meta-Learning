@@ -1,8 +1,14 @@
+"""
+Utitlity functions to be used in the main program
+
+__author__ = "MM. Kamani"
+"""
 import collections
 import six
 
 import tensorflow as tf
 import numpy as np
+import csv
 
 from tensorflow.python.platform import tf_logging as logging
 from tensorflow.core.framework import node_def_pb2
@@ -11,7 +17,7 @@ from tensorflow.python.training import basic_session_run_hooks
 from tensorflow.python.training import session_run_hook
 from tensorflow.python.training import training_util
 from tensorflow.python.training import device_setter
-from tensorflow.contrib.learn.python.learn import run_config
+# from tensorflow.contrib.learn.python.learn import run_config
 from tensorflow.python.client import device_lib
 
 
@@ -35,13 +41,13 @@ class RunConfig(tf.estimator.RunConfig):
     Returns:
       A uid string.
     """
-    if whitelist is None:
-      whitelist = run_config._DEFAULT_UID_WHITE_LIST
+    # if whitelist is None:
+    #   whitelist = run_config._DEFAULT_UID_WHITE_LIST
 
     state = {k: v for k, v in self.__dict__.items() if not k.startswith('__')}
     # Pop out the keys in whitelist.
-    for k in whitelist:
-      state.pop('_' + k, None)
+    # for k in whitelist:
+    #   state.pop('_' + k, None)
 
     ordered_state = collections.OrderedDict(
         sorted(state.items(), key=lambda t: t[0]))
@@ -167,5 +173,80 @@ class NanFinderHook(session_run_hook.SessionRunHook):
     logging.info(nan_list_ev)
     logging.info(inf_list_ev)
 
+class WeightUpdateHook(tf.estimator.SessionRunHook):
+  def __init__(
+    self,
+    weight,
+    update_weight,
+    index):
+    self.weight = weight
+    self.update_weight = update_weight
+    self.index = index
+    self.sample_weight_dict = {}
+    self.sample_weight = tf.placeholder(tf.float32, self.weight.shape)
+    self.update_op = [tf.assign(self.weight, self.sample_weight)]
+
+  def before_run(self, run_context):
+    # self.inds = run_context.session.run(self.index)
+    # sample_weight_value = [self.sample_weight_dict[i] if i in self.sample_weight_dict else 0.0 for i in self.inds]
+    sample_weight_value = np.zeros(self.weight.shape)
+    run_context.session.run(self.update_op, feed_dict={self.sample_weight:sample_weight_value})
+
+  # def after_run(self,run_context,run_values):
+  #   # weight_values = run_context.session.run(self.update_weight)
+    # self.sample_weight_dict.update(zip(self.inds, weight_values))
 
 
+class WeightUpdateHook1(tf.estimator.SessionRunHook):
+  def __init__(
+    self,
+    weight,
+    update_weight,
+    every_n_steps=10,
+    every_n_secs=None,
+    log_every_n_step=100):
+
+    self.weight = weight
+    self.update_weight = update_weight
+    self.log_every_n_step = log_every_n_step
+    # self.sample_weight_dict = {}
+    # self.sample_weight = tf.placeholder(tf.float32, self.weight.shape)
+    self.update_op = [tf.compat.v1.assign(self.weight, self.update_weight)]
+    
+
+    if (every_n_steps is None) == (every_n_secs is None):
+      raise ValueError('exactly one of every_n_steps'
+                       ' and every_n_secs should be provided.')
+    self._timer = basic_session_run_hooks.SecondOrStepTimer(
+        every_steps=every_n_steps, every_secs=every_n_secs)
+
+  
+  def begin(self):
+    self._global_step_tensor = training_util.get_global_step()
+    if self._global_step_tensor is None:
+      raise RuntimeError(
+          'Global step should be created to use StepCounterHook.')
+
+  def before_run(self, run_context):
+    global_step = run_context.session.run(self._global_step_tensor)
+    if self._timer.should_trigger_for_step(global_step):
+      # self.inds = run_context.session.run(self.index)
+      # sample_weight_value = [self.sample_weight_dict[i] if i in self.sample_weight_dict else 0.0 for i in self.inds]
+      # sample_weight_value = np.zeros(self.weight.shape)
+      run_context.session.run(self.update_op)
+      if global_step % self.log_every_n_step == 0:
+        new_weight_value = np.squeeze(run_context.session.run(self.update_weight))
+        logging.info('Weights updated in step {}'.format(global_step))
+        logging.info('New weights are: {}'.format(new_weight_value))
+      # with open('weights.csv', 'w') as f:
+      #   writer = csv.writer(f)
+      #   writer.writerow(new_weight_value)
+      self._timer.update_last_triggered_step(global_step)
+  # def after_run(self,run_context,run_values):
+  #   weight_values = run_context.session.run(self.update_weight)
+  #   self.sample_weight_dict.update(zip(self.inds, weight_values))
+
+
+class dict2obj:
+    def __init__(self, **entries):
+        self.__dict__.update(entries)
