@@ -44,21 +44,21 @@ class BilevelConvNet(BilevelModel):
 		super(BilevelConvNet, self).__init__()
 		self.num_class = num_class
 		self.conv1 = tf.keras.layers.Conv2D(filters=32,
-																	kernel_size=3,
-																	activation=tf.nn.relu)
+						    kernel_size=3,
+						    activation=tf.nn.relu)
 		self.conv2 = tf.keras.layers.Conv2D(filters=64,
-																	kernel_size=3,
-																	activation=tf.nn.relu)
+						    kernel_size=3,
+						    activation=tf.nn.relu)
 		self.max_pool1 = tf.keras.layers.MaxPooling2D(pool_size=2, strides=2)
 		self.dropout1 = tf.keras.layers.Dropout(0.25)
 
 		self.conv3 = tf.keras.layers.Conv2D(filters=128,
-																	kernel_size=3,
-																	activation=tf.nn.relu)
+						    kernel_size=3,
+						    activation=tf.nn.relu)
 		self.max_pool2 = tf.keras.layers.MaxPooling2D(pool_size=2, strides=2)
 		self.conv4 = tf.keras.layers.Conv2D(filters=128,
-																	kernel_size=3,
-																	activation=tf.nn.relu)
+						    kernel_size=3,
+						    activation=tf.nn.relu)
 		self.max_pool3 = tf.keras.layers.MaxPooling2D(pool_size=2, strides=2)
 		self.dropout2 = tf.keras.layers.Dropout(0.25)
 
