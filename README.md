@@ -24,7 +24,7 @@ First, you need to install the requirements using the following command:
 ```
 
 ### Generating Dataset
-For the sake of experiment, you could use the following command to generating an inbalanced or a long-tailed dataset from MNIST or CIFAR datasets. To do that, you can run this command:
+For the sake of experiment, you could use the following command to generating an imbalanced or a long-tailed dataset from MNIST or CIFAR datasets. To do that, you can run this command:
 ```bash
 python makeImbalanceDataset.py --data-dir ./data/mnist_23_0995 \
                                --dataset mnist \
